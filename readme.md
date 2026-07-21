@@ -202,17 +202,33 @@ or
 
 Disparity values in pixels.
 
+For a batch whose images have different Cityscapes camera calibrations, pass
+each camera parameter as a `(B,)` tensor (or Python sequence):
+
+```python
+labels = cluster_disparity(
+    disparity_batch,
+    fx=torch.tensor([fx0, fx1], device=disparity_batch.device),
+    fy=torch.tensor([fy0, fy1], device=disparity_batch.device),
+    cx=torch.tensor([cx0, cx1], device=disparity_batch.device),
+    cy=torch.tensor([cy0, cy1], device=disparity_batch.device),
+    baseline=torch.tensor([baseline0, baseline1], device=disparity_batch.device),
+)
+```
+
+Scalar values are still accepted and are shared by every image in the batch.
+
 ---
 
 ## Parameters
 
 | Parameter         | Description               |
 | ----------------- | ------------------------- |
-| fx                | Camera focal length (x)   |
-| fy                | Camera focal length (y)   |
-| cx                | Principal point (x)       |
-| cy                | Principal point (y)       |
-| baseline          | Stereo baseline in meters |
+| fx                | Camera focal length (x), scalar or `(B,)` |
+| fy                | Camera focal length (y), scalar or `(B,)`; defaults to `fx` |
+| cx                | Principal point (x), scalar or `(B,)` |
+| cy                | Principal point (y), scalar or `(B,)` |
+| baseline          | Stereo baseline in meters, scalar or `(B,)` |
 | theta_deg         | Clustering threshold      |
 | min_size          | Minimum cluster size      |
 | ground            | Enable ground removal     |
