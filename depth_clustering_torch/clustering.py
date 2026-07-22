@@ -77,19 +77,35 @@ def build_alphas(row_angles, col_angles, wrap=True):
 # disparity / depth -> Euclidean range image (pure-torch, vectorized)
 # --------------------------------------------------------------------------
 
-def _range_factor(H, W, fx, fy, cx, cy, device, dtype=torch.float32):
-    """Precompute sqrt(xn^2 + yn^2 + 1) over the pixel grid (a (H,W) map)."""
-    v = torch.arange(H, device=device, dtype=dtype)
-    u = torch.arange(W, device=device, dtype=dtype)
-    yn = ((v - cy) / fy).view(H, 1)
-    xn = ((u - cx) / fx).view(1, W)
+def _batch_param(value, name, B, device, dtype):
+    """Return a scalar or per-image camera parameter as a (B,) tensor."""
+    value = torch.as_tensor(value, device=device, dtype=dtype)
+    if value.numel() == 1:
+        return value.reshape(1).expand(B)
+    if value.dim() == 1 and value.numel() == B:
+        return value
+    raise ValueError(f"{name} must be a scalar or have shape (B,), got {tuple(value.shape)} for B={B}")
+
+
+def _range_factor(B, H, W, fx, fy, cx, cy, device, dtype=torch.float32):
+    """Build sqrt(xn^2 + yn^2 + 1), with shape (B,H,W)."""
+    fx = _batch_param(fx, "fx", B, device, dtype)
+    fy = _batch_param(fy, "fy", B, device, dtype)
+    cx = _batch_param(cx, "cx", B, device, dtype)
+    cy = _batch_param(cy, "cy", B, device, dtype)
+    v = torch.arange(H, device=device, dtype=dtype).view(1, H, 1)
+    u = torch.arange(W, device=device, dtype=dtype).view(1, 1, W)
+    yn = (v - cy.view(B, 1, 1)) / fy.view(B, 1, 1)
+    xn = (u - cx.view(B, 1, 1)) / fx.view(B, 1, 1)
     return torch.sqrt(xn * xn + yn * yn + 1.0)
 
 
 def disparity_to_range(disparity, fx, baseline, cx, cy, fy=None, min_disp=1e-3):
     """Convert a stereo disparity image to a Euclidean range image.
 
-    disparity: (H,W) or (B,H,W) in pixels. fx/fy in pixels, baseline in metres.
+    disparity: (H,W) or (B,H,W) in pixels. Camera parameters may be scalars
+    shared by the batch or tensors/sequences of shape (B,). fx/fy are in pixels
+    and baseline is in metres.
     Returns (range_img, valid) with the same leading shape; range in metres,
     valid = disparity > min_disp. Fully vectorized; runs wherever the tensor lives.
     """
@@ -97,9 +113,11 @@ def disparity_to_range(disparity, fx, baseline, cx, cy, fy=None, min_disp=1e-3):
         disparity = disparity.unsqueeze(0)
     B, H, W = disparity.shape
     fy = fx if fy is None else fy
-    factor = _range_factor(H, W, fx, fy, cx, cy, disparity.device, disparity.dtype)
+    factor = _range_factor(B, H, W, fx, fy, cx, cy, disparity.device, disparity.dtype)
+    fx = _batch_param(fx, "fx", B, disparity.device, disparity.dtype)
+    baseline = _batch_param(baseline, "baseline", B, disparity.device, disparity.dtype)
     valid = disparity > min_disp
-    z = (fx * baseline) / disparity.clamp_min(min_disp)      # depth along axis
+    z = (fx * baseline).view(B, 1, 1) / disparity.clamp_min(min_disp)
     range_img = z * factor                                   # Euclidean range
     range_img = torch.where(valid, range_img, torch.zeros_like(range_img))
     return range_img, valid
@@ -111,7 +129,7 @@ def depth_to_range(depth, fx, cx, cy, fy=None):
         depth = depth.unsqueeze(0)
     B, H, W = depth.shape
     fy = fx if fy is None else fy
-    factor = _range_factor(H, W, fx, fy, cx, cy, depth.device, depth.dtype)
+    factor = _range_factor(B, H, W, fx, fy, cx, cy, depth.device, depth.dtype)
     valid = depth > 0
     return torch.where(valid, depth * factor, torch.zeros_like(depth)), valid
 
@@ -119,12 +137,21 @@ def depth_to_range(depth, fx, cx, cy, fy=None):
 def pinhole_alphas(H, W, fx, fy, cx, cy):
     """Per-axis angular steps for a pinhole camera (separable approximation),
     ready to pass as (row_alphas, col_alphas) to cluster() with wrap=False."""
-    v = torch.arange(H + 1, dtype=torch.float32)
-    u = torch.arange(W + 1, dtype=torch.float32)
-    phi = torch.atan((v - cy) / fy)          # vertical ray angle per row edge
-    theta = torch.atan((u - cx) / fx)        # horizontal ray angle per col edge
-    row_alphas = (phi[1:] - phi[:-1]).abs()  # (H,)
-    col_alphas = (theta[1:] - theta[:-1]).abs()  # (W,)
+    values = [torch.as_tensor(x) for x in (fx, fy, cx, cy)]
+    B = max(x.numel() for x in values)
+    device = next((x.device for x in values if x.numel() > 1), values[0].device)
+    fx = _batch_param(fx, "fx", B, device, torch.float32)
+    fy = _batch_param(fy, "fy", B, device, torch.float32)
+    cx = _batch_param(cx, "cx", B, device, torch.float32)
+    cy = _batch_param(cy, "cy", B, device, torch.float32)
+    v = torch.arange(H + 1, device=device, dtype=torch.float32).view(1, H + 1)
+    u = torch.arange(W + 1, device=device, dtype=torch.float32).view(1, W + 1)
+    phi = torch.atan((v - cy[:, None]) / fy[:, None])
+    theta = torch.atan((u - cx[:, None]) / fx[:, None])
+    row_alphas = (phi[:, 1:] - phi[:, :-1]).abs()
+    col_alphas = (theta[:, 1:] - theta[:, :-1]).abs()
+    if B == 1 and all(x.numel() == 1 for x in values):
+        return row_alphas[0], col_alphas[0]
     return row_alphas, col_alphas
 
 
@@ -307,16 +334,21 @@ def remove_ground(range_img, valid, row_angles, ground_angle_thresh=math.radians
     vectorized approximation of DepthGroundRemover (no Savitzky-Golay smoothing).
     """
     B, H, W = range_img.shape
-    ra = row_angles.to(range_img.device, torch.float32)
+    ra = torch.as_tensor(row_angles, device=range_img.device, dtype=torch.float32)
+    if ra.dim() == 1:
+        if ra.numel() != H:
+            raise ValueError(f"row_angles must have length H={H}, got {ra.numel()}")
+        ra = ra.unsqueeze(0).expand(B, -1)
+    elif ra.shape != (B, H):
+        raise ValueError(f"row_angles must have shape (H,) or (B,H), got {tuple(ra.shape)}")
     d_cur = range_img[:, :-1, :]
     d_below = range_img[:, 1:, :]
     both = valid[:, :-1, :] & valid[:, 1:, :]
-    dalpha = (ra[1:] - ra[:-1]).abs().view(1, H - 1, 1)
     # incline angle of the line between the two vertical beam hits
-    dz = (d_below * torch.sin(ra[1:].view(1, -1, 1)) -
-          d_cur * torch.sin(ra[:-1].view(1, -1, 1)))
-    dx = (d_below * torch.cos(ra[1:].view(1, -1, 1)) -
-          d_cur * torch.cos(ra[:-1].view(1, -1, 1)))
+    dz = (d_below * torch.sin(ra[:, 1:, None]) -
+          d_cur * torch.sin(ra[:, :-1, None]))
+    dx = (d_below * torch.cos(ra[:, 1:, None]) -
+          d_cur * torch.cos(ra[:, :-1, None]))
     angle = torch.atan2(dz.abs(), dx.abs().clamp_min(1e-9))
     ground = torch.zeros(B, H, W, dtype=torch.bool, device=range_img.device)
     is_g = both & (angle < ground_angle_thresh)
@@ -405,8 +437,14 @@ def cluster_reference(range_img, valid, row_alphas, col_alphas, threshold,
     B, H, W = range_img.shape
     dev = range_img.device
     valid = valid & (range_img > 0)
-    ra = row_alphas.to(dev).view(1, H, 1)
-    ca = col_alphas.to(dev).view(1, 1, W)
+    ra = row_alphas.to(dev)
+    ca = col_alphas.to(dev)
+    ra = ra.view(1, H).expand(B, -1) if ra.dim() == 1 else ra
+    ca = ca.view(1, W).expand(B, -1) if ca.dim() == 1 else ca
+    if ra.shape != (B, H) or ca.shape != (B, W):
+        raise ValueError("alphas must have shape (H,)/(W,) or (B,H)/(B,W)")
+    ra = ra.unsqueeze(2)
+    ca = ca.unsqueeze(1)
 
     idx = torch.arange(B * H * W, device=dev).view(B, H, W).int()
     lab = torch.where(valid, idx, torch.full_like(idx, -1))

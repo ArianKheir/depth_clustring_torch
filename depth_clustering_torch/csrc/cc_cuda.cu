@@ -96,7 +96,7 @@ __global__ void merge_kernel(int* __restrict__ L,
     if (r + 1 < H) {
         long nidx = (long)b * hw + (long)(r + 1) * W + c;
         if (valid[nidx]) {
-            float beta = get_beta(row_alphas[r], d, range[nidx]);
+            float beta = get_beta(row_alphas[(long)b * H + r], d, range[nidx]);
             if (beta > threshold) merge(L, (int)idx, (int)nidx);
         }
     }
@@ -106,10 +106,10 @@ __global__ void merge_kernel(int* __restrict__ L,
     float alpha_c = 0.f;
     if (c + 1 < W) {
         nc = c + 1;
-        alpha_c = col_alphas[c];
+        alpha_c = col_alphas[(long)b * W + c];
     } else if (wrap) {
         nc = 0;
-        alpha_c = col_alphas[W - 1];   // wrap alpha stored at last entry
+        alpha_c = col_alphas[(long)b * W + W - 1];
     }
     if (nc >= 0) {
         long nidx = (long)b * hw + (long)r * W + nc;
@@ -148,8 +148,12 @@ torch::Tensor cluster_cuda(torch::Tensor range,
     col_alphas = col_alphas.to(range.device(), torch::kFloat32).contiguous();
 
     int B = range.size(0), H = range.size(1), W = range.size(2);
-    TORCH_CHECK(row_alphas.numel() == H, "row_alphas must have length H");
-    TORCH_CHECK(col_alphas.numel() == W, "col_alphas must have length W");
+    TORCH_CHECK(row_alphas.numel() == H || row_alphas.numel() == B * H,
+                "row_alphas must have shape (H,) or (B,H)");
+    TORCH_CHECK(col_alphas.numel() == W || col_alphas.numel() == B * W,
+                "col_alphas must have shape (W,) or (B,W)");
+    if (row_alphas.numel() == H) row_alphas = row_alphas.repeat({B, 1});
+    if (col_alphas.numel() == W) col_alphas = col_alphas.repeat({B, 1});
 
     long n = (long)B * H * W;
     auto opts = torch::TensorOptions().dtype(torch::kInt32).device(range.device());
